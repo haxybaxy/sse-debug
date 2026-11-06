@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>SSE live test</title>
+<style>
+  body { font: 14px/1.4 system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
+  button { margin: 0 .4rem .4rem 0; padding: .4rem .8rem; cursor: pointer; }
+  label { margin-right: 1rem; }
+  #out { min-height: 3rem; padding: .8rem; border: 1px solid #ccc; border-radius: 6px; margin: 1rem 0; white-space: pre-wrap; }
+  #log { height: 320px; overflow: auto; background: #111; color: #9f9; padding: .6rem; font: 12px/1.4 ui-monospace, monospace; border-radius: 6px; }
+  .hint { color: #555; font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>SSE live test</h1>
+<p class="hint">Open DevTools → Network before clicking. Each log line shows when the browser received the event
+  (ms since start) and the gap between the server sending it and the page seeing it.</p>
+
+<div>
+  <button id="es">EventSource (GET /sse)</button>
+  <button id="fetch">fetch + stream (POST /chat)</button>
+  <button id="stop">Stop</button>
+</div>
+<div>
+  <label>Delay per token (ms) <input id="delay" type="number" value="300" min="10" style="width:5rem"></label>
+  <label><input id="buffered" type="checkbox"> Simulate buffering (server sends everything at the end)</label>
+</div>
+
+<div id="out"></div>
+<div id="log"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let es, controller, t0;
+
+const qs = () => `?delay=${$("delay").value}&buffered=${$("buffered").checked ? 1 : 0}`;
+const log = (msg) => {
+  const line = document.createElement("div");
+  line.textContent = `[+${String(Math.round(performance.now() - t0)).padStart(6)}ms] ${msg}`;
+  $("log").append(line);
+  $("log").scrollTop = $("log").scrollHeight;
+};
+const onEvent = (type, data) => {
+  const d = JSON.parse(data);
+  const lag = Date.now() - d.sentAt;
+  if (type === "token") $("out").textContent += d.text;
+  log(`${type.padEnd(5)} #${d.i ?? "-"} lag=${lag}ms ${d.text ? JSON.stringify(d.text) : ""}`);
+};
+const reset = () => {
+  stop();
+  $("out").textContent = "";
+  $("log").textContent = "";
+  t0 = performance.now();
+};
+function stop() {
+  if (es) { es.close(); es = null; }
+  if (controller) { controller.abort(); controller = null; }
+}
+
+// 1) Native EventSource — what DevTools' event-stream viewers are built around.
+$("es").onclick = () => {
+  reset();
+  log("opening EventSource /sse");
+  es = new EventSource("/sse" + qs());
+  es.onopen = () => log("open");
+  es.addEventListener("token", (e) => onEvent("token", e.data));
+  es.addEventListener("done", (e) => { onEvent("done", e.data); stop(); log("closed"); });
+  es.onerror = () => { log("error / closed"); stop(); };
+};
+
+// 2) fetch() POST + ReadableStream — how most AI chat apps (OpenAI/Anthropic SDKs) consume SSE.
+$("fetch").onclick = async () => {
+  reset();
+  controller = new AbortController();
+  log("POST /chat");
+  try {
+    const res = await fetch("/chat" + qs(), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: "hi" }),
+      signal: controller.signal,
+    });
+    log(`response headers received (${res.status} ${res.headers.get("content-type")})`);
+    const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      log(`chunk received (${value.length} chars)`);
+      buf += value;
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) !== -1) {
+        const raw = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        let event = "message", data = "";
+        for (const line of raw.split("\n")) {
+          if (line.startsWith("event:")) event = line.slice(6).trim();
+          else if (line.startsWith("data:")) data += line.slice(5).trim();
+        }
+        if (data) onEvent(event, data);
+      }
+    }
+    log("stream ended");
+  } catch (e) {
+    log(e.name === "AbortError" ? "aborted" : "error: " + e.message);
+  }
+};
+$("stop").onclick = () => { stop(); log("stopped"); };
+</script>
+</body>
+</html>
